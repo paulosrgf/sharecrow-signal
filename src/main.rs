@@ -6,16 +6,23 @@ use axum::{
     Router,
 };
 use futures_util::{SinkExt, StreamExt};
-use rand::RngExt;
+// CORREÇÃO: Usar rand::Rng ao invés de RngExt
+use rand::Rng;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::{mpsc, Mutex};
+
 type Tx = mpsc::UnboundedSender<Message>;
+
+struct Peer {
+    id: String,
+    tx: Tx,
+}
 
 #[derive(Default)]
 struct Room {
-    peers: Vec<Tx>,
+    peers: Vec<Peer>,
 }
 
 type Rooms = Arc<Mutex<HashMap<String, Room>>>;
@@ -24,28 +31,52 @@ type Rooms = Arc<Mutex<HashMap<String, Room>>>;
 #[serde(tag = "type", rename_all = "snake_case")]
 enum ClientMsg {
     Create,
-    Join { code: String },
-    Relay { payload: serde_json::Value },
+    Join {
+        code: String,
+    },
+    Relay {
+        #[serde(default)]
+        target_peer_id: Option<String>,
+        payload: serde_json::Value,
+    },
 }
 
 #[derive(Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum ServerMsg<'a> {
-    Created { code: String },
+    Created {
+        code: String,
+    },
     Joined,
-    PeerJoined,
-    PeerLeft,
-    Relay { payload: &'a serde_json::Value },
-    Error { message: String },
+    RoomUpdate {
+        count: usize,
+    },
+    PeerJoined {
+        peer_id: String,
+    },
+    PeerLeft {
+        peer_id: String,
+    },
+    Relay {
+        peer_id: String,
+        payload: &'a serde_json::Value,
+    },
+    Error {
+        message: String,
+    },
 }
 
 fn generate_code() -> String {
-    const CHARS: &[u8] = b"ABCDEFGHJKLMNPQRSTUVWXYZ23456789"; // sem caracteres ambíguos (0/O, 1/I)
+    const CHARS: &[u8] = b"ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
     let mut rng = rand::rng();
-    (0..6).map(|_| CHARS[rng.random_range(0..CHARS.len())] as char).collect()
+    (0..6)
+        // CORREÇÃO: random_range está disponível trazendo rand::Rng para o escopo
+        .map(|_| CHARS[rng.random_range(0..CHARS.len())] as char)
+        .collect()
 }
 
 fn to_message<T: Serialize>(msg: &T) -> Message {
+    // CORREÇÃO: Simplificado para evitar problemas de tipos de string do Axum
     Message::Text(serde_json::to_string(msg).unwrap().into())
 }
 
@@ -53,14 +84,14 @@ fn to_message<T: Serialize>(msg: &T) -> Message {
 async fn main() {
     let rooms: Rooms = Arc::new(Mutex::new(HashMap::new()));
 
-    let app = Router::new().route("/ws", get(ws_handler)).with_state(rooms);
+    let app = Router::new()
+        .route("/ws", get(ws_handler))
+        .with_state(rooms);
 
-    // Render injeta a porta dinamicamente via variável de ambiente "PORT"
-    // Caso rode local, ele pega o 8787 como padrão.
     let port = std::env::var("PORT").unwrap_or_else(|_| "8787".to_string());
     let addr = format!("0.0.0.0:{}", port);
-
     let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
+
     println!("sharecrow-signal ouvindo em {}", addr);
     axum::serve(listener, app).await.unwrap();
 }
@@ -81,13 +112,18 @@ async fn handle_socket(socket: WebSocket, rooms: Rooms) {
         }
     });
 
+    let peer_id = uuid::Uuid::new_v4().to_string();
     let mut current_room: Option<String> = None;
 
     while let Some(Ok(msg)) = ws_rx.next().await {
+        // CORREÇÃO: Garante que apenas mensagens de texto sejam processadas,
+        // ignorando pings/pongs sem quebrar o loop.
         let Message::Text(text) = msg else { continue };
 
         let Ok(client_msg) = serde_json::from_str::<ClientMsg>(&text) else {
-            let _ = tx.send(to_message(&ServerMsg::Error { message: "mensagem inválida".into() }));
+            let _ = tx.send(to_message(&ServerMsg::Error {
+                message: "mensagem inválida".into(),
+            }));
             continue;
         };
 
@@ -95,33 +131,75 @@ async fn handle_socket(socket: WebSocket, rooms: Rooms) {
             ClientMsg::Create => {
                 let code = generate_code();
                 let mut rooms_guard = rooms.lock().await;
-                rooms_guard.insert(code.clone(), Room { peers: vec![tx.clone()] });
+
+                rooms_guard.insert(
+                    code.clone(),
+                    Room {
+                        peers: vec![Peer {
+                            id: peer_id.clone(),
+                            tx: tx.clone(),
+                        }],
+                    },
+                );
+
                 current_room = Some(code.clone());
+
                 let _ = tx.send(to_message(&ServerMsg::Created { code }));
+                let _ = tx.send(to_message(&ServerMsg::RoomUpdate { count: 1 }));
             }
             ClientMsg::Join { code } => {
                 let mut rooms_guard = rooms.lock().await;
+
                 let Some(room) = rooms_guard.get_mut(&code) else {
-                    let _ = tx.send(to_message(&ServerMsg::Error { message: "sala não encontrada".into() }));
+                    let _ = tx.send(to_message(&ServerMsg::Error {
+                        message: "sala não encontrada".into(),
+                    }));
                     continue;
                 };
-                if room.peers.len() >= 2 {
-                    let _ = tx.send(to_message(&ServerMsg::Error { message: "sala cheia".into() }));
-                    continue;
-                }
-                room.peers.push(tx.clone());
+
+                room.peers.push(Peer {
+                    id: peer_id.clone(),
+                    tx: tx.clone(),
+                });
+
                 current_room = Some(code.clone());
+                let count = room.peers.len();
+                let new_peer_id = peer_id.clone();
+
+                let _ = tx.send(to_message(&ServerMsg::Joined));
+
                 for peer in &room.peers {
-                    let _ = peer.send(to_message(&ServerMsg::PeerJoined));
+                    if peer.id != peer_id {
+                        let _ = peer.tx.send(to_message(&ServerMsg::PeerJoined {
+                            peer_id: new_peer_id.clone(),
+                        }));
+                    }
+                    let _ = peer.tx.send(to_message(&ServerMsg::RoomUpdate { count }));
                 }
             }
-            ClientMsg::Relay { payload } => {
+            ClientMsg::Relay {
+                target_peer_id,
+                payload,
+            } => {
                 let Some(code) = &current_room else { continue };
                 let rooms_guard = rooms.lock().await;
+
                 if let Some(room) = rooms_guard.get(code) {
-                    for peer in &room.peers {
-                        if !peer.same_channel(&tx) {
-                            let _ = peer.send(to_message(&ServerMsg::Relay { payload: &payload }));
+                    if let Some(target_id) = target_peer_id {
+                        if let Some(target_peer) = room.peers.iter().find(|p| p.id == target_id) {
+                            let _ = target_peer.tx.send(to_message(&ServerMsg::Relay {
+                                peer_id: peer_id.clone(),
+                                payload: &payload,
+                            }));
+                        }
+                    } else {
+                        for peer in &room.peers {
+                            if peer.id != peer_id {
+                                let _ = peer.tx.send(to_message(&ServerMsg::Relay {
+                                    peer_id: peer_id.clone(),
+                                    payload: &payload,
+                                }));
+                            }
                         }
                     }
                 }
@@ -129,13 +207,20 @@ async fn handle_socket(socket: WebSocket, rooms: Rooms) {
         }
     }
 
+    // Limpeza ao desconectar
     if let Some(code) = current_room {
         let mut rooms_guard = rooms.lock().await;
         if let Some(room) = rooms_guard.get_mut(&code) {
-            room.peers.retain(|p| !p.same_channel(&tx));
+            room.peers.retain(|p| p.id != peer_id);
+            let count = room.peers.len();
+
             for peer in &room.peers {
-                let _ = peer.send(to_message(&ServerMsg::PeerLeft));
+                let _ = peer.tx.send(to_message(&ServerMsg::PeerLeft {
+                    peer_id: peer_id.clone(),
+                }));
+                let _ = peer.tx.send(to_message(&ServerMsg::RoomUpdate { count }));
             }
+
             if room.peers.is_empty() {
                 rooms_guard.remove(&code);
             }
